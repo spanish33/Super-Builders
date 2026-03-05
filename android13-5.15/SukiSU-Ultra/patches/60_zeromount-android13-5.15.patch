@@ -225,7 +225,7 @@ diff -ruN a/fs/readdir.c b/fs/readdir.c
 +	}
 +#endif
 +
- #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ #ifdef CONFIG_KSU_SUSFS_HIDDEN_NAME
  	buf.sb = f.file->f_inode->i_sb;
  #endif
  	error = iterate_dir(f.file, &buf.ctx);
@@ -273,7 +273,7 @@ diff -ruN a/fs/readdir.c b/fs/readdir.c
 +	}
 +#endif
 +
- #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ #ifdef CONFIG_KSU_SUSFS_HIDDEN_NAME
  	buf.sb = f.file->f_inode->i_sb;
  #endif
  	error = iterate_dir(f.file, &buf.ctx);
@@ -321,7 +321,7 @@ diff -ruN a/fs/readdir.c b/fs/readdir.c
 +	}
 +#endif
 +
- #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ #ifdef CONFIG_KSU_SUSFS_HIDDEN_NAME
  	buf.sb = f.file->f_inode->i_sb;
  #endif
  	error = iterate_dir(f.file, &buf.ctx);
