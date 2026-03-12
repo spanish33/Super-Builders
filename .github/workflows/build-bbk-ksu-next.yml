@@ -360,7 +360,7 @@ jobs:
           cd kernel_platform
           python3 build_with_bazel.py -t "$CPUD" "$BUILD_METHOD" || BUILD_RC=$?
           cd ..
-        elif [ -n "$CPUD" ] && [ -f "kernel_platform/oplus/build/oplus_build_kernel.sh" ]; then
+        elif [ -n "$CPUD" ] && [ -f "kernel_platform/oplus/build/oplus_build_kernel.sh" ] && [ -f "kernel_platform/oplus/build/oplus_setup.sh" ]; then
           cd kernel_platform
           LTO="${LTO_MODE}" SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 \
             KMI_SYMBOL_LIST_STRICT_MODE=0 \
@@ -388,6 +388,19 @@ jobs:
             exit "$BUILD_RC"
           fi
         fi
+
+    - name: Dump Build Errors
+      if: failure()
+      run: |
+        echo "::group::Build directory structure"
+        ls -la "$SYNC_DIR/kernel_platform/" 2>/dev/null || true
+        ls -la "$SYNC_DIR/kernel_platform/oplus/build/" 2>/dev/null || true
+        echo "::endgroup::"
+        for LOG in $(find "$SYNC_DIR" -name '*.log' -newer "$SYNC_DIR/.repo" -type f 2>/dev/null | head -5); do
+          echo "::group::$(basename "$LOG")"
+          tail -80 "$LOG"
+          echo "::endgroup::"
+        done
 
     - name: Prepare AnyKernel3
       run: |

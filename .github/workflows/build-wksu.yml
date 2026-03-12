@@ -394,6 +394,15 @@ jobs:
           fi
         fi
 
+    - name: Dump Build Errors
+      if: failure()
+      run: |
+        for LOG in $(find "$KERNEL_ROOT" -name '*.log' -newer "$KERNEL_ROOT/common" -type f 2>/dev/null | head -5); do
+          echo "::group::$(basename "$LOG")"
+          tail -80 "$LOG"
+          echo "::endgroup::"
+        done
+
     - name: Prepare AnyKernel3
       run: |
         if [ -f "$KERNEL_ROOT/out/${ANDROID_VER}-${KERNEL_VER}/dist/Image" ]; then
