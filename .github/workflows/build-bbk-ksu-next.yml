@@ -1,0 +1,494 @@
+name: "BBK OGKI - KernelSU-Next"
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device key from bbk-devices.json"
+        type: string
+        required: true
+      add_susfs:
+        description: "Add SUSFS support"
+        type: boolean
+        default: true
+      add_zeromount:
+        description: "Add ZeroMount"
+        type: boolean
+        default: true
+      add_kpm:
+        description: "Add KPM support"
+        type: boolean
+        default: false
+      add_zram:
+        description: "Promote ZRAM to builtin (=y)"
+        type: boolean
+        default: false
+      lto_mode:
+        description: "LTO mode"
+        type: choice
+        options: [thin, full, none]
+        default: thin
+      susfs_branch:
+        description: "SUSFS branch override (auto-detect if empty)"
+        type: string
+        default: ""
+      sukisu_commit:
+        description: "KernelSU-Next commit (empty = pinned default)"
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      device:
+        type: string
+        required: true
+      add_susfs:
+        type: boolean
+        default: true
+      add_zeromount:
+        type: boolean
+        default: true
+      add_kpm:
+        type: boolean
+        default: false
+      add_zram:
+        type: boolean
+        default: false
+      lto_mode:
+        type: string
+        default: thin
+      susfs_branch:
+        type: string
+        default: ""
+      sukisu_commit:
+        type: string
+        default: ""
+
+jobs:
+  build:
+    name: "BBK KernelSU-Next — ${{ inputs.device }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      KSU_VARIANT: KernelSU-Next
+      KSU_DIR: KernelSU-Next
+      DEVICE_KEY: ${{ inputs.device }}
+
+    steps:
+    - name: Free Disk Space
+      uses: endersonmenezes/free-disk-space@v3
+      with:
+        remove_android: true
+        remove_dotnet: true
+        remove_haskell: true
+        remove_tool_cache: true
+        remove_swap: true
+        remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+        remove_packages_one_command: true
+        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+        rm_cmd: "rmz"
+        rmz_version: "3.1.1"
+        testing: false
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq lld binutils flex bison libssl-dev libelf-dev gcc-aarch64-linux-gnu
+
+    - name: Install Repo Tool
+      run: |
+        mkdir -p "$HOME/bin"
+        curl -LSso "$HOME/bin/repo" https://storage.googleapis.com/git-repo-downloads/repo
+        chmod +x "$HOME/bin/repo"
+        echo "$HOME/bin" >> "$GITHUB_PATH"
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Parse Device Registry
+      run: |
+        REGISTRY="$GITHUB_WORKSPACE/.github/inputs/bbk-devices.json"
+        if [ ! -f "$REGISTRY" ]; then
+          echo "FATAL: bbk-devices.json not found"
+          exit 1
+        fi
+
+        DEVICE_JSON=$(jq -e ".\"${DEVICE_KEY}\"" "$REGISTRY")
+        if [ "$DEVICE_JSON" = "null" ] || [ -z "$DEVICE_JSON" ]; then
+          echo "FATAL: device '$DEVICE_KEY' not found in registry"
+          echo "Available devices:"
+          jq -r 'keys[]' "$REGISTRY" | head -20
+          exit 1
+        fi
+
+        BRAND=$(echo "$DEVICE_JSON" | jq -r '.brand')
+        DEVICE_NAME=$(echo "$DEVICE_JSON" | jq -r '.name')
+        SOC=$(echo "$DEVICE_JSON" | jq -r '.soc')
+        CODENAME=$(echo "$DEVICE_JSON" | jq -r '.codename // empty')
+        ANDROID_VER=$(echo "$DEVICE_JSON" | jq -r '.android_version')
+        KERNEL_VER=$(echo "$DEVICE_JSON" | jq -r '.kernel_version')
+        BUILD_METHOD=$(echo "$DEVICE_JSON" | jq -r '.build_method')
+        MANIFEST_REPO=$(echo "$DEVICE_JSON" | jq -r '.manifest_repo')
+        MANIFEST_BRANCH=$(echo "$DEVICE_JSON" | jq -r '.manifest_branch')
+        HMBIRD=$(echo "$DEVICE_JSON" | jq -r '.hmbird // false')
+        EXTRA_ARTIFACTS=$(echo "$DEVICE_JSON" | jq -r '.extra_artifacts // [] | join(",")')
+
+        # Map kernel version to canonical GKI patch directory
+        # Patches are organized by GKI convention, not device android version
+        VERSION_DIR="${ANDROID_VER}-${KERNEL_VER}"
+        if [ ! -d "$GITHUB_WORKSPACE/$VERSION_DIR" ]; then
+          case "$KERNEL_VER" in
+            5.4)   VERSION_DIR="android12-5.4" ;;
+            5.10)  VERSION_DIR="android13-5.10" ;;
+            5.15)  VERSION_DIR="android14-5.15" ;;
+            6.1)   VERSION_DIR="android14-6.1" ;;
+            6.6)   VERSION_DIR="android15-6.6" ;;
+            6.12)  VERSION_DIR="android16-6.12" ;;
+            *)     echo "::error::No patch directory for kernel $KERNEL_VER (tried ${ANDROID_VER}-${KERNEL_VER})"
+                   exit 1 ;;
+          esac
+          echo "::notice::Mapped ${ANDROID_VER}-${KERNEL_VER} -> ${VERSION_DIR}"
+        fi
+        if [ ! -d "$GITHUB_WORKSPACE/$VERSION_DIR" ]; then
+          echo "FATAL: patch directory '$VERSION_DIR' not found"
+          ls "$GITHUB_WORKSPACE"
+          exit 1
+        fi
+        # Extract GKI prefix for patch filenames (e.g., android15-6.6 from VERSION_DIR)
+        GKI_TAG="${VERSION_DIR}"
+
+        {
+          echo "BRAND=$BRAND"
+          echo "DEVICE_NAME=$DEVICE_NAME"
+          echo "SOC=$SOC"
+          echo "CODENAME=$CODENAME"
+          echo "ANDROID_VER=$ANDROID_VER"
+          echo "KERNEL_VER=$KERNEL_VER"
+          echo "BUILD_METHOD=$BUILD_METHOD"
+          echo "MANIFEST_REPO=$MANIFEST_REPO"
+          echo "MANIFEST_BRANCH=$MANIFEST_BRANCH"
+          echo "HMBIRD=$HMBIRD"
+          echo "EXTRA_ARTIFACTS=$EXTRA_ARTIFACTS"
+          echo "VERSION_DIR=$VERSION_DIR"
+          echo "GKI_TAG=$GKI_TAG"
+          echo "OGKI_HELPERS=$GITHUB_WORKSPACE/android12-5.10/build-helpers"
+        } >> "$GITHUB_ENV"
+
+        echo "Device: $DEVICE_NAME ($BRAND) | SoC: $SOC ($CODENAME) | Kernel: $KERNEL_VER | Android: $ANDROID_VER"
+
+    - name: Repo Init and Sync
+      run: |
+        SYNC_DIR="$GITHUB_WORKSPACE/ogki-source"
+        mkdir -p "$SYNC_DIR"
+        cd "$SYNC_DIR"
+
+        repo init -u "https://github.com/${MANIFEST_REPO}.git" \
+          -b "refs/heads/${MANIFEST_BRANCH}" \
+          -m "${DEVICE_KEY}.xml" --depth=1
+
+        repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle --force-sync --fail-fast
+
+        echo "SYNC_DIR=$SYNC_DIR" >> "$GITHUB_ENV"
+        echo "KERNEL_COMMON=$SYNC_DIR/kernel_platform/common" >> "$GITHUB_ENV"
+        echo "DEFCONFIG=$SYNC_DIR/kernel_platform/common/arch/arm64/configs/gki_defconfig" >> "$GITHUB_ENV"
+        echo "DEFCONFIG_FRAGMENT=$SYNC_DIR/kernel_platform/common/arch/arm64/configs/sukisu_gki.fragment" >> "$GITHUB_ENV"
+
+    - name: ABI Bypass
+      run: |
+        cd "$SYNC_DIR"
+        bash "$OGKI_HELPERS/bypass-ogki-abi.sh"
+
+    - name: Remove Dirty Suffix
+      run: |
+        cd "$SYNC_DIR"
+        for SLV in kernel_platform/common/scripts/setlocalversion \
+                    kernel_platform/msm-kernel/scripts/setlocalversion \
+                    external/dtc/scripts/setlocalversion; do
+          [ -f "$SLV" ] && sed -i 's/ -dirty//g' "$SLV"
+        done
+
+    - name: Detect Kernel Version
+      run: |
+        MAKEFILE="$KERNEL_COMMON/Makefile"
+        if [ ! -f "$MAKEFILE" ]; then
+          echo "FATAL: kernel Makefile not found at $MAKEFILE"
+          exit 1
+        fi
+
+        SUBLEVEL=$(grep '^SUBLEVEL = ' "$MAKEFILE" | awk '{print $3}')
+        DETECTED_KVER="$(grep '^VERSION = ' "$MAKEFILE" | awk '{print $3}').$(grep '^PATCHLEVEL = ' "$MAKEFILE" | awk '{print $3}')"
+
+        if [ "$DETECTED_KVER" != "$KERNEL_VER" ]; then
+          echo "::warning::Detected kernel $DETECTED_KVER but device registry says $KERNEL_VER"
+        fi
+
+        ARTIFACT_BASE="${KERNEL_VER}.${SUBLEVEL}-${ANDROID_VER}-${DEVICE_KEY}-KernelSU-Next"
+        {
+          echo "SUBLEVEL=$SUBLEVEL"
+          echo "ARTIFACT_BASE=$ARTIFACT_BASE"
+          echo "FILE_NAME=$ARTIFACT_BASE"
+        } >> "$GITHUB_ENV"
+
+        echo "Kernel: ${KERNEL_VER}.${SUBLEVEL}"
+
+    - name: Clone AnyKernel3
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$GITHUB_WORKSPACE/AnyKernel3"
+
+    - name: Setup KernelSU-Next
+      working-directory: ${{ env.KERNEL_COMMON }}
+      env:
+        SUKISU_COMMIT: ${{ inputs.sukisu_commit }}
+        SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+      run: |
+        BRANCH="${SUSFS_BRANCH:-stable}"
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/stable/kernel/setup.sh" | bash -s "$BRANCH"
+        [ -d "$KSU_DIR" ] || { echo "FATAL: $KSU_DIR not created by setup.sh"; exit 1; }
+
+        PIN="${SUKISU_COMMIT:-$(cat "$GITHUB_WORKSPACE/$VERSION_DIR/kernelsu-next-pin.txt" 2>/dev/null || true)}"
+        if [ -n "$PIN" ]; then
+          cd "$KSU_DIR"
+          git fetch origin
+          git checkout "$PIN"
+          echo "Pinned KernelSU-Next to $(git rev-parse --short=7 HEAD)"
+        fi
+
+    - name: Fix Old Kernel Compatibility
+      working-directory: ${{ env.KERNEL_COMMON }}
+      run: |
+        FIX_SCRIPT="$GITHUB_WORKSPACE/$VERSION_DIR/build-helpers/fix-old-kernel-compat.sh"
+        if [ -f "$FIX_SCRIPT" ]; then
+          bash "$FIX_SCRIPT" "$KERNEL_COMMON" "$SUBLEVEL"
+        fi
+
+    - name: Apply Upstream SUSFS Patch
+      if: inputs.add_susfs
+      working-directory: ${{ env.KERNEL_COMMON }}
+      run: |
+        patch -p1 -F3 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$VERSION_DIR/KernelSU-Next/patches/50_add_susfs_in_gki-${GKI_TAG}.patch"
+
+    - name: Apply Enhanced SUSFS Patch
+      if: inputs.add_susfs
+      working-directory: ${{ env.KERNEL_COMMON }}
+      run: |
+        patch -p1 -F3 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$VERSION_DIR/KernelSU-Next/patches/51_enhanced_susfs-${GKI_TAG}.patch"
+
+    - name: Apply KSU Safety Patch
+      if: inputs.add_susfs
+      working-directory: ${{ env.KERNEL_COMMON }}/${{ env.KSU_DIR }}
+      run: |
+        PATCH="$GITHUB_WORKSPACE/$VERSION_DIR/KernelSU-Next/patches/70_ksu_safety-kernelsu-next-${KERNEL_VER}.patch"
+        [ -s "$PATCH" ] && patch -p1 --no-backup-if-mismatch < "$PATCH" || echo "No 70_ patch needed"
+
+    - name: Apply ZeroMount Patch
+      if: inputs.add_zeromount && inputs.add_susfs
+      working-directory: ${{ env.KERNEL_COMMON }}
+      run: |
+        patch -p1 -F3 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$VERSION_DIR/KernelSU-Next/patches/60_zeromount-${GKI_TAG}.patch"
+
+    - name: Fix SUSFS Compatibility
+      if: inputs.add_susfs
+      working-directory: ${{ env.KERNEL_COMMON }}
+      run: |
+        FIX="$GITHUB_WORKSPACE/$VERSION_DIR/build-helpers/fix-susfs-compat.sh"
+        if [ -f "$FIX" ]; then
+          bash "$FIX" . "$SUBLEVEL" "$ANDROID_VER" "$KERNEL_VER" ""
+        fi
+
+    - name: Apply HMBird Patch
+      if: env.HMBIRD == 'true'
+      working-directory: ${{ env.KERNEL_COMMON }}
+      run: |
+        HMBIRD_SCRIPT="$OGKI_HELPERS/hmbird-setup.sh"
+        if [ -f "$HMBIRD_SCRIPT" ]; then
+          bash "$HMBIRD_SCRIPT" "$SYNC_DIR/kernel_platform" || true
+        else
+          echo "::warning::HMBird enabled but hmbird-setup.sh not found — skipping"
+        fi
+
+    - name: Assemble Defconfig
+      working-directory: ${{ env.SYNC_DIR }}
+      env:
+        ADD_SUSFS: ${{ inputs.add_susfs }}
+        ADD_ZEROMOUNT: ${{ inputs.add_zeromount }}
+        ADD_KPM: ${{ inputs.add_kpm }}
+        ADD_ZRAM: ${{ inputs.add_zram }}
+        LTO_MODE: ${{ inputs.lto_mode }}
+      run: |
+        OGKI_DEFCONFIG_SCRIPT="$OGKI_HELPERS/assemble-ogki-defconfig.sh"
+        if [ -f "$OGKI_DEFCONFIG_SCRIPT" ]; then
+          KCONFIG_SEARCH_DIR="$KERNEL_COMMON" \
+            bash "$OGKI_DEFCONFIG_SCRIPT" "$DEFCONFIG" "$KSU_VARIANT"
+        else
+          FRAGMENT="$GITHUB_WORKSPACE/$VERSION_DIR/defconfig.fragment"
+          HELPERS="$GITHUB_WORKSPACE/$VERSION_DIR/build-helpers"
+          ASSEMBLE_FLAGS=""
+          [[ "$ADD_SUSFS" == "true" ]] && ASSEMBLE_FLAGS="$ASSEMBLE_FLAGS --susfs --overlayfs"
+          [[ "$ADD_KPM" == "true" ]] && ASSEMBLE_FLAGS="$ASSEMBLE_FLAGS --kpm"
+          [[ "$ADD_ZRAM" == "true" ]] && ASSEMBLE_FLAGS="$ASSEMBLE_FLAGS --zram"
+          bash "$HELPERS/assemble-defconfig.sh" "$FRAGMENT" "$DEFCONFIG_FRAGMENT" "$DEFCONFIG" $ASSEMBLE_FLAGS
+        fi
+
+    - name: Build Kernel
+      working-directory: ${{ env.SYNC_DIR }}
+      env:
+        LTO_MODE: ${{ inputs.lto_mode }}
+      run: |
+        BUILD_RC=0
+        CPUD="${CODENAME:-}"
+        if [ -z "$CPUD" ]; then
+          echo "Device has no QCOM codename, using direct build"
+        fi
+
+        # Detect prebuilt clang from repo sync
+        CLANG_DIR=$(find kernel_platform/prebuilts/clang/host/linux-x86/ -maxdepth 1 -type d -name 'clang-*' 2>/dev/null | sort -V | tail -1)
+        if [ -n "$CLANG_DIR" ]; then
+          export PATH="$(realpath "$CLANG_DIR")/bin:$PATH"
+          echo "Using prebuilt clang: $CLANG_DIR"
+        else
+          echo "::warning::No prebuilt clang found — using system clang"
+        fi
+
+        # Bazel first (sm8650+), then OEM script, then direct make
+        if [ -n "$CPUD" ] && [ -f "kernel_platform/build_with_bazel.py" ]; then
+          cd kernel_platform
+          python3 build_with_bazel.py -t "$CPUD" "$BUILD_METHOD" || BUILD_RC=$?
+          cd ..
+        elif [ -n "$CPUD" ] && [ -f "kernel_platform/oplus/build/oplus_build_kernel.sh" ]; then
+          cd kernel_platform
+          LTO="${LTO_MODE}" SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 \
+            KMI_SYMBOL_LIST_STRICT_MODE=0 \
+            bash oplus/build/oplus_build_kernel.sh "$CPUD" "$BUILD_METHOD" || BUILD_RC=$?
+          cd ..
+        else
+          cd "$KERNEL_COMMON"
+          make O=out ARCH=arm64 LLVM=1 \
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            gki_defconfig
+
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 \
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- || BUILD_RC=$?
+          cd "$SYNC_DIR"
+        fi
+
+        if [ "$BUILD_RC" -ne 0 ]; then
+          if find . -name "Image" -type f 2>/dev/null | grep -q .; then
+            echo "::warning::Build exited $BUILD_RC but Image exists (likely depmod failure)"
+          else
+            exit "$BUILD_RC"
+          fi
+        fi
+
+    - name: Prepare AnyKernel3
+      run: |
+        ANYKERNEL="$GITHUB_WORKSPACE/AnyKernel3"
+        CPUD="${CODENAME:-}"
+        IMAGE=""
+
+        for CANDIDATE in \
+          "$SYNC_DIR/out/msm-kernel-${CPUD}-${BUILD_METHOD}/dist/Image" \
+          "$SYNC_DIR/bazel-out/k8-fastbuild/bin/msm-kernel/${CPUD}_gki_kbuild_mixed_tree/Image" \
+          "$SYNC_DIR/out/msm-${CPUD}-${CPUD}-${BUILD_METHOD}/dist/Image" \
+          "$SYNC_DIR/out/msm-kernel-${CPUD}-${BUILD_METHOD}/gki_kernel/common/arch/arm64/boot/Image" \
+          "$KERNEL_COMMON/out/arch/arm64/boot/Image"; do
+          if [ -f "$CANDIDATE" ]; then
+            IMAGE="$CANDIDATE"
+            break
+          fi
+        done
+
+        if [ -z "$IMAGE" ]; then
+          echo "FATAL: Kernel Image not found in any known location"
+          find "$SYNC_DIR" -name "Image" -type f 2>/dev/null || true
+          exit 1
+        fi
+
+        cp "$IMAGE" "$ANYKERNEL/Image"
+        echo "Image: $IMAGE ($(stat -c%s "$IMAGE") bytes)"
+
+        if [ -n "$EXTRA_ARTIFACTS" ]; then
+          IFS=',' read -ra EXTRAS <<< "$EXTRA_ARTIFACTS"
+          DIST_DIR=$(dirname "$IMAGE")
+          for EXTRA in "${EXTRAS[@]}"; do
+            EXTRA_PATH="$DIST_DIR/$EXTRA"
+            [ ! -f "$EXTRA_PATH" ] && EXTRA_PATH="$DIST_DIR/${EXTRA%.img}.erofs.img"
+            if [ -f "$EXTRA_PATH" ]; then
+              cp "$EXTRA_PATH" "$ANYKERNEL/$EXTRA"
+              echo "Extra: $EXTRA ($(stat -c%s "$EXTRA_PATH") bytes)"
+            else
+              echo "::warning::Extra artifact '$EXTRA' not found in $DIST_DIR"
+            fi
+          done
+        fi
+
+    - name: Scan Patch Rejects
+      if: always()
+      run: |
+        REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
+        mkdir -p "$REJECTS_DIR"
+        mapfile -t REJS < <(find "$SYNC_DIR" -type f -name '*.rej' 2>/dev/null)
+        REJ_COUNT=${#REJS[@]}
+        echo "REJ_COUNT=$REJ_COUNT" >> "$GITHUB_ENV"
+        if [ "$REJ_COUNT" -gt 0 ]; then
+          for REJ in "${REJS[@]}"; do
+            REL="${REJ#"$SYNC_DIR"/}"
+            DEST="$REJECTS_DIR/$REL"
+            mkdir -p "$(dirname "$DEST")"
+            cp "$REJ" "$DEST"
+            ORIG="${REJ%.rej}"
+            [ -f "$ORIG" ] && cp "$ORIG" "$REJECTS_DIR/${REL%.rej}"
+          done
+        fi
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.FILE_NAME }}-AnyKernel3
+        path: ./AnyKernel3/**
+        if-no-files-found: error
+        compression-level: 9
+
+    - name: Upload Rejects
+      if: always() && env.REJ_COUNT > 0
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.FILE_NAME }}-Rejects
+        path: patch-rejects/
+        if-no-files-found: ignore
+        compression-level: 9
+
+    - name: Job Summary
+      if: always()
+      env:
+        ADD_SUSFS: ${{ inputs.add_susfs }}
+        ADD_ZEROMOUNT: ${{ inputs.add_zeromount }}
+        ADD_KPM: ${{ inputs.add_kpm }}
+        LTO_MODE: ${{ inputs.lto_mode }}
+      run: |
+        S() { [[ "$1" == "true" ]] && echo "Enabled" || echo "Disabled"; }
+        {
+          echo "## BBK OGKI KernelSU-Next | ${DEVICE_NAME}"
+          echo ""
+          echo "| Property | Value |"
+          echo "|----------|-------|"
+          echo "| **Device** | ${DEVICE_NAME} (${DEVICE_KEY}) |"
+          echo "| **Brand** | ${BRAND} |"
+          echo "| **SoC** | ${SOC} (${CODENAME}) |"
+          echo "| **Kernel** | ${KERNEL_VER}.${SUBLEVEL} |"
+          echo "| **Android** | ${ANDROID_VER} |"
+          echo "| **Build Method** | ${BUILD_METHOD} |"
+          echo "| **LTO** | ${LTO_MODE} |"
+          echo "| **Enhanced SUSFS** | $(S "$ADD_SUSFS") |"
+          echo "| **ZeroMount** | $(S "$ADD_ZEROMOUNT") |"
+          echo "| **KPM** | $(S "$ADD_KPM") |"
+          echo "| **HMBird** | $(S "$HMBIRD") |"
+          echo "| **Rejects** | ${REJ_COUNT:-0} |"
+          echo "| **Artifact** | ${FILE_NAME} |"
+        } >> "$GITHUB_STEP_SUMMARY"
