@@ -357,7 +357,11 @@ jobs:
       working-directory: ${{ env.KERNEL_COMMON }}
       run: |
         export PATH="${CLANG_BIN}:$PATH"
-        export PLATFORM_VERSION_FOR_GPU="${ANDROID_VER##android}"
+
+        # Samsung Exynos Kconfig uses $(PLATFORM_VERSION_FOR_GPU) comparison
+        # syntax not supported by standard Kconfig parser — strip those lines
+        find . -name Kconfig -exec grep -l 'PLATFORM_VERSION_FOR_GPU' {} \; 2>/dev/null |
+          xargs -r sed -i '/\$(PLATFORM_VERSION_FOR_GPU)/d'
 
         sed -i 's|\(.\)obj-\$(CONFIG_KSU) += kernelsu/|\1\nobj-$(CONFIG_KSU) += kernelsu/|' drivers/Makefile 2>/dev/null || true
 
