@@ -335,7 +335,7 @@ jobs:
 
     - name: Disable Samsung Security
       run: |
-        bash "$OEM_HELPERS/disable-samsung-security.sh" "$DEFCONFIG"
+        bash "$OEM_HELPERS/disable-samsung-security.sh" "$DEFCONFIG" "$KERNEL_COMMON"
         # Exynos Bazel builds use a separate defconfig
         for extra in "$KERNEL_COMMON"/arch/arm64/configs/*-bazel_defconfig; do
           [ -f "$extra" ] && bash "$OEM_HELPERS/disable-samsung-security.sh" "$extra" || true

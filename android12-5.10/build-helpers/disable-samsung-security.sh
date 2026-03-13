@@ -3,6 +3,7 @@
 # Without this, KSU module loading is blocked at boot
 
 DEFCONFIG="$1"
+KERNEL_DIR="${2:-}"
 [ -f "$DEFCONFIG" ] || { echo "disable-samsung-security: defconfig not found: $DEFCONFIG"; exit 1; }
 
 CONFIGS=(
@@ -26,3 +27,12 @@ for cfg in "${CONFIGS[@]}"; do
 done
 
 echo "disable-samsung-security: disabled ${#CONFIGS[@]} security configs in $(basename "$DEFCONFIG")"
+
+# sec_debug_test.c uses FP inline asm that system clang rejects under -mgeneral-regs-only
+if [ -n "$KERNEL_DIR" ]; then
+  DBGMK="$KERNEL_DIR/drivers/samsung/debug/Makefile"
+  if [ -f "$DBGMK" ]; then
+    sed -i '/sec_debug_test/d' "$DBGMK"
+    echo "disable-samsung-security: removed sec_debug_test from debug Makefile"
+  fi
+fi
